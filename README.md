@@ -1,8 +1,10 @@
 # fastEsa — MLBricks PROGRESS ESA variants
 
-This **independent, installable Python library** packages the two exact model
-implementations from the supplied Kaggle PROGRESS notebooks without changing
-any of their recurrence equations, scans, gate parameters, or checkpoint keys.
+This **independent, installable Python library** includes the two original
+PROGRESS model implementations alongside optimized FAST execution backends.
+The original model equations, gate parameters, and checkpoint keys are kept.
+Select `scan="original"` to reproduce the exact original FAST scan; the new
+default `scan="auto"` chooses accelerated implementations.
 
 | Public variant | Exact notebook implementation | Mixer class |
 |---|---|---|
@@ -17,9 +19,9 @@ datasets/hardware. No trained weights were included in the uploaded material.
 ## Install
 
 ```bash
-pip install ./fastEsa
+pip install .
 # Or from the generated wheel (torch/numpy must be available):
-pip install ./fastesa-0.1.0-py3-none-any.whl
+pip install ./fastesa-0.3.0-py3-none-any.whl
 ```
 
 ## Mixer use (the original equations, without modifications)
@@ -99,15 +101,17 @@ python -m fastesa._original.progress_hybrid --action smoke --device cpu --dim 48
 
 Original scripts use their original default Kaggle output directories and
 model labels (`learned` and `hybrid`). New public aliases do not rename
-checkpoint directories or modify existing experiments. No Triton or CUDA
-extension compilation is required. CPU and CUDA PyTorch are supported.
+checkpoint directories or modify existing experiments. The original reference and Thunder PyTorch paths need no CUDA extension.
+The default FAST CUDA SWQR path lazily compiles an optional native CUDA
+extension (set `scan="thunder"` to skip it). CPU and CUDA PyTorch are supported.
 
 ## Mathematical summary
 
 `fast`: `q,g,vraw = W_qgv x`; `A = alpha_h +(beta_h-alpha_h)*sigmoid(g)`;
 `U = (1-A)*tanh(vraw)`; `E = A*Eprev + U`;
 `Y = W_O(sigmoid(q)*RMSNorm(E))`. `alpha/beta` are trainable bounds.
-Scan uses cumulative products/divisions over chunks of 32.
+Original scan uses cumulative products/divisions over chunks of 32;
+v0.3 default FAST dispatch uses SWQR CUDA or Thunder PyTorch.
 
 `quality`: `q,g,vraw = W_qgv x`; `A = exp(-ln(2)*softplus(g+b_h)/half_life_h)`;
 `U = (1-A)*tanh(vraw)`; `E = A*Eprev + U`;
@@ -131,3 +135,32 @@ python -m pytest -q tests
 ```
 
 Original extraction checksums are recorded in `SOURCE_PROVENANCE.txt`.
+
+## v0.3 fastEsa backend patch
+
+**Current FAST default:** `scan='auto'` — SWQR native CUDA for multi-token
+training/prefill, PyTorch Thunder when CUDA SWQR is unavailable, and the
+one-token direct recurrence during autoregressive decoding. This is an
+**execution backend change, not a new architecture or pretrained checkpoint**.
+The `quality` variant continues to use its original PROGRESS hybrid scan.
+
+```python
+import torch
+from fastesa import make_esa, make_model, forward_tokens, prepare_swqr
+
+mixer = make_esa('fast', dim=384, heads=6, scan='auto')
+model = make_model('fast', dim=384, heads=6, layers=6)
+x = torch.randn(2, 128, 384)
+y, state = mixer(x)
+next_y, next_state = mixer(x[:, :1], state)  # direct recurrence
+
+# On CUDA, prepare_swqr() compiles the optional native extension once.
+# Use scan='swqr' if you want to REQUIRE native SWQR and fail on missing CUDA.
+# Use scan='original' for exact historical PROGRESS training behavior.
+```
+
+Source distributions and wheels contain CUDA sources, not precompiled GPU
+binaries. A C++ compiler, a matching CUDA toolkit with `nvcc`, and a CUDA
+PyTorch wheel are needed to compile native SWQR on the target host. The
+module is compiled lazily; CPU use does not require CUDA. See
+`RELEASE_NOTES_v0.3.md` for benchmarks/validation limitations.

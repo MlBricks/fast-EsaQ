@@ -3,3 +3,6 @@ recursive-include fastesa *.py
 recursive-include tests *.py
 recursive-include examples *.py
 include SOURCE_PROVENANCE.txt
+
+recursive-include fastesa/_cuda *.cu *.cpp
+include RELEASE_NOTES_v0.3.md

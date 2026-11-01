@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastEsa"
-version = "0.1.0"
-description = "MLBricks fastEsa: original PROGRESS Learned ESA (fast) and Hybrid ESA (quality) variants"
+version = "0.3.0"
+description = "MLBricks fastEsa with SWQR CUDA, Thunder, and direct recurrent decode"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.2", "numpy>=1.24"]
 readme = "README.md"
@@ -17,3 +17,6 @@ classifiers = ["Programming Language :: Python :: 3", "Programming Language :: P
 
 [tool.setuptools.packages.find]
 include = ["fastesa", "fastesa.*"]
+
+[tool.setuptools.package-data]
+"fastesa" = ["_cuda/*.cu", "_cuda/*.cpp"]
