@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastEsa"
+version = "0.1.0"
+description = "MLBricks fastEsa: original PROGRESS Learned ESA (fast) and Hybrid ESA (quality) variants"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "numpy>=1.24"]
+readme = "README.md"
+license = {file = "LICENSE.md"}
+authors = [{name = "Zameer Hussain"}, {name = "Akhtar Hussain"}]
+keywords = ["ESA", "MLBricks", "fastEsa", "recurrent state", "PyTorch"]
+classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only",
+ "Operating System :: OS Independent", "Topic :: Scientific/Engineering :: Artificial Intelligence"]
+
+[tool.setuptools.packages.find]
+include = ["fastesa", "fastesa.*"]

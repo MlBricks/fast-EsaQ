@@ -1,0 +1,6 @@
+PROGRESS model worker sources, copied byte-for-byte from embedded WORKER_SOURCE:
+notebooke1d3be5124 (3).ipynb cell 6 -> fastesa/_original/progress_learned.py
+    sha256: d6fc84e25837cc06e70134dcd4aa1ad8e1e17383c46f7db50fe35214b537a5fb
+notebook724cd3ff66 (8).ipynb cell 6 -> fastesa/_original/progress_hybrid.py
+    sha256: f5096c9166cb6b7672d64eb85f14b83ebfd3cee031fb024d1b5eb436a996f317
+Licence: LICENSE.md and LICENSING_NOTICE.md from ESA-main (2)(1).zip
