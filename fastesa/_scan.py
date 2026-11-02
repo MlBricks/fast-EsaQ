@@ -18,7 +18,7 @@ from torch.nn import functional as F
 
 _SUPPORTED_CHUNKS = {16, 32, 64, 128, 256, 512}
 _EXTENSIONS: dict[str, object] = {}
-_FAILED_EXTENSIONS: set[str] = set()
+_FAILED_EXTENSIONS: set[tuple[str, str]] = set()
 
 
 def _validate(A: Tensor, U: Tensor, state: Tensor | None) -> None:
@@ -143,27 +143,184 @@ def swqr_scan(A: Tensor, U: Tensor, state: Tensor | None = None, *, chunk: int =
     return _SWQR.apply(A.contiguous(), U.contiguous(), initial, chunk)
 
 
+def select_swqr_backend(batch: int, seq: int, device: torch.device | str,
+                        *, device_name: str | None = None,
+                        capability: tuple[int, int] | None = None) -> tuple[str, int | None]:
+    """Pure shape/device dispatch policy, no kernels launched or model weights changed.
+
+    Returns (backend, warps) where backend is direct, thunder, swqr, or
+    swqr_short. Current short preferences are based ONLY on Tesla T4 / sm75
+    benchmark measurements (not assumed transferable to other GPUs).
+    Supply device_name/capability for offline policy tests.
+    """
+    if not isinstance(batch, int) or batch < 1 or not isinstance(seq, int) or seq < 1:
+        raise ValueError("batch and sequence lengths must be positive integers")
+    if seq == 1:
+        return "direct", None
+    target = torch.device(device)
+    if target.type != "cuda":
+        return "thunder", None
+    if device_name is None or capability is None:
+        try:
+            props = torch.cuda.get_device_properties(target)
+        except (RuntimeError, AssertionError):
+            # Unknown CUDA device: prefer the already-validated long SWQR path.
+            return "swqr", None
+        if device_name is None:
+            device_name = props.name
+        if capability is None:
+            capability = (props.major, props.minor)
+    is_t4 = (capability == (7, 5) and
+             device_name.strip().lower() in {"tesla t4", "nvidia t4"})
+    if is_t4:
+        if batch == 1 and 128 <= seq <= 512:
+            return "swqr_short", 16
+        if batch == 2 and 128 <= seq <= 256:
+            return "swqr_short", 8
+    return "swqr", None
+
+
+def _scan_selected(A: Tensor, U: Tensor, state: Tensor | None,
+                   backend: str, warps: int | None, chunk: int) -> Tensor:
+    if backend == "swqr_short":
+        assert warps is not None
+        return swqr_short_scan(A, U, state, warps=warps)
+    if backend == "swqr":
+        return swqr_scan(A, U, state, chunk=chunk)
+    if backend == "direct":
+        return direct_scan(A, U, state)
+    raise RuntimeError(f"Unsupported native scan backend {backend!r}")
+
+
 def auto_scan(A: Tensor, U: Tensor, state: Tensor | None = None, *,
               compass: int = 16, chunk: int = 128) -> Tensor:
-    """SWQR on CUDA, Thunder otherwise; direct one-token decode.
+    """T4-aware fastEsa v0.3.2 dispatcher; safe Thunder fallback.
 
-    If extension compilation fails, warn once and fall back to Thunder;
-    explicit scan='swqr' never hides a failed native build.
+    Failed short-extension compilation falls back to original SWQR first.
+    If SWQR is also unavailable, falls back to PyTorch Thunder. Explicit
+    scan='swqr_adaptive' and 'swqr_short' never silently use another backend.
     """
+    _validate(A, U, state)
     if A.shape[1] == 1:
         return direct_scan(A, U, state)
-    if A.is_cuda and os.getenv("FASTESA_DISABLE_SWQR", "0") != "1":
-        if str(A.device) not in _FAILED_EXTENSIONS:
-            try:
-                return swqr_scan(A, U, state, chunk=chunk)
-            except (RuntimeError, OSError, ImportError) as exc:
-                _FAILED_EXTENSIONS.add(str(A.device))
-                warnings.warn(f"SWQR native unavailable ({type(exc).__name__}: {exc}); "
-                              "using PyTorch Thunder. Explicit scan='swqr' raises instead.",
-                              RuntimeWarning, stacklevel=2)
+    if not A.is_cuda or os.getenv("FASTESA_DISABLE_SWQR", "0") == "1":
+        return thunder_scan(A, U, state, compass=compass)
+    backend, warps = select_swqr_backend(A.shape[0], A.shape[1], A.device)
+    key = (str(A.device), backend)
+    if backend == "swqr_short" and key not in _FAILED_EXTENSIONS:
+        try:
+            return swqr_short_scan(A, U, state, warps=warps)
+        except (RuntimeError, OSError, ImportError) as exc:
+            _FAILED_EXTENSIONS.add(key)
+            warnings.warn(f"SWQR-Short unavailable ({type(exc).__name__}: {exc}); "
+                          "falling back to original SWQR", RuntimeWarning, stacklevel=2)
+    key = (str(A.device), "swqr")
+    if key not in _FAILED_EXTENSIONS:
+        try:
+            return swqr_scan(A, U, state, chunk=chunk)
+        except (RuntimeError, OSError, ImportError) as exc:
+            _FAILED_EXTENSIONS.add(key)
+            warnings.warn(f"SWQR native unavailable ({type(exc).__name__}: {exc}); "
+                          "falling back to PyTorch Thunder", RuntimeWarning, stacklevel=2)
     return thunder_scan(A, U, state, compass=compass)
 
 
 def prepare_swqr() -> None:
     """Precompile native SWQR (optional, e.g. before timing CUDA benchmarks)."""
     _extension()
+
+
+def _short_extension():
+    """Lazy load of the independent SWQR-Short native CUDA extension."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("SWQR-Short requires CUDA")
+    from torch.utils.cpp_extension import load
+    root = Path(__file__).resolve().parent / "_cuda"
+    sources = [root / "swqr_short_bindings.cpp", root / "swqr_short_scan.cu"]
+    if not all(p.is_file() for p in sources):
+        raise RuntimeError("SWQR-Short native CUDA source files missing")
+    name = "mlbricks_fastesa_swqr_short_031"
+    if name not in _EXTENSIONS:
+        os.environ.setdefault("MAX_JOBS", "2")
+        _EXTENSIONS[name] = load(
+            name=name, sources=[str(p) for p in sources],
+            extra_cflags=["-O2"], extra_cuda_cflags=["-O3"],
+            verbose=os.getenv("FASTESA_CUDA_VERBOSE", "0") == "1",
+        )
+    return _EXTENSIONS[name]
+
+
+class _SWQRShort(Function):
+    @staticmethod
+    def forward(ctx, A: Tensor, U: Tensor, state: Tensor, warps: int):
+        E = _short_extension().scan(A.contiguous(), U.contiguous(), state.contiguous(), warps)
+        ctx.save_for_backward(A, E, state)
+        ctx.warps = warps
+        return E
+
+    @staticmethod
+    def backward(ctx, gradE: Tensor):
+        A, E, state = ctx.saved_tensors
+        # Reverse-time affine recurrence. Exact gradient of E[t]=A[t]E[t-1]+U[t].
+        Ar = torch.cat((torch.zeros_like(A[:, :1]), A[:, 1:].flip(1)), dim=1).contiguous()
+        Ur = gradE.float().flip(1).contiguous()
+        r = _short_extension().scan(Ar, Ur, A.new_empty(0), ctx.warps).flip(1)
+        previous = torch.cat((state.unsqueeze(1) if state.numel() else
+                              torch.zeros_like(E[:, :1]), E[:, :-1]), dim=1)
+        dA = r * previous
+        dU = r
+        dState = (A[:, 0] * r[:, 0]).contiguous() if state.numel() else None
+        return dA, dU, dState, None
+
+
+def swqr_short_scan(A: Tensor, U: Tensor, state: Tensor | None = None, *,
+                    warps: int = 8) -> Tensor:
+    """Experimental single-launch FP32 CUDA scan for 2..2048 tokens.
+
+    Deliberately opt-in: the existing SWQR implementation remains unchanged.
+    No silent fallback: a missing compiler or a native failure raises.
+    """
+    _validate(A, U, state)
+    if warps not in (4, 8, 16):
+        raise ValueError("warps must be 4, 8 or 16")
+    if A.size(1) == 1:
+        return direct_scan(A, U, state)
+    if A.size(1) > 2048:
+        raise ValueError("SWQR-Short supports at most 2048 tokens; use 'swqr_adaptive'")
+    if not A.is_cuda:
+        raise RuntimeError("scan='swqr_short' requires CUDA")
+    initial = state.float().contiguous() if state is not None else A.new_empty(0)
+    return _SWQRShort.apply(A.contiguous(), U.contiguous(), initial, warps)
+
+
+def swqr_adaptive_scan(A: Tensor, U: Tensor, state: Tensor | None = None, *,
+                       warps: int = 8, chunk: int = 128,
+                       cutoff: int | None = None) -> Tensor:
+    """Strict native batch-aware dispatch, without any hidden fallback.
+
+    No cutoff (default): T4 batch/length policy, original SWQR elsewhere.
+    Explicit cutoff: backwards-compatible v0.3.1 fixed-length policy using
+    the caller-supplied warps. This also serves as a manual policy override.
+    """
+    _validate(A, U, state)
+    if warps not in (4, 8, 16):
+        raise ValueError("warps must be 4, 8, or 16")
+    if chunk not in _SUPPORTED_CHUNKS:
+        raise ValueError("unsupported SWQR chunk size")
+    if cutoff is not None and (not isinstance(cutoff, int) or not 2 <= cutoff <= 2048):
+        raise ValueError("cutoff must be in [2,2048]")
+    if A.size(1) == 1:
+        return direct_scan(A, U, state)
+    if not A.is_cuda:
+        raise RuntimeError("scan='swqr_adaptive' requires CUDA; use 'auto' on CPU")
+    if cutoff is not None:
+        backend, selected_warps = (("swqr_short", warps) if A.size(1) <= cutoff
+                                   else ("swqr", None))
+    else:
+        backend, selected_warps = select_swqr_backend(A.size(0), A.size(1), A.device)
+    return _scan_selected(A, U, state, backend, selected_warps, chunk)
+
+
+def prepare_swqr_short() -> None:
+    """Optionally precompile the SWQR-Short extension before GPU benchmarking."""
+    _short_extension()

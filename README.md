@@ -164,3 +164,66 @@ binaries. A C++ compiler, a matching CUDA toolkit with `nvcc`, and a CUDA
 PyTorch wheel are needed to compile native SWQR on the target host. The
 module is compiled lazily; CPU use does not require CUDA. See
 `RELEASE_NOTES_v0.3.md` for benchmarks/validation limitations.
+
+## Experimental SWQR-Short CUDA (v0.3.1)
+
+The optional backend `scan="swqr_short"` implements the same learned-retention
+FAST recurrence using a **one-launch, block-parallel native CUDA scan** for
+sequences of 2–2048 tokens. Each warp accesses contiguous channels; different
+warps handle adjacent sequence segments and exchange affine summaries in
+shared memory. It is a separate kernel from the v0.3 native SWQR long scan.
+No parameter names or checkpoint keys are changed.
+
+```python
+from fastesa import make_esa
+short = make_esa("fast", dim=648, heads=6, scan="swqr_short", swqr_warps=8)
+adaptive = make_esa("fast", dim=648, heads=6, scan="swqr_adaptive", swqr_warps=8)
+```
+
+- `swqr_short`: 2–2048 sequence lengths, explicit CUDA compilation required.
+- `swqr_adaptive`: use SWQR-Short up to 1024 by default and **original** SWQR above 1024.
+- `swqr`: unchanged native CUDA behavior. `auto` is also unchanged in v0.3.1.
+- 1-token decode always uses the lightweight direct recurrent state update.
+- `swqr_warps`: 4, 8, or 16. Benchmark all values; no universal optimum assumed.
+- `prepare_swqr_short()` explicitly compiles the extension before GPU timing.
+- Experimental autograd uses reverse-time SWQR-Short for `dA`, `dU`, and
+  optional `dInitialState` with retained intermediate output states. This
+  is not yet a fully fused training backward kernel.
+
+**Validation:** CPU reference emulation tests are not evidence of CUDA
+correctness or speed. Run the supplied T4 parity/throughput notebook before
+choosing a production default. ESA native Thunder code is separately licensed
+under the terms accompanying that source; this patch does not copy ESA kernels.
+
+## v0.3.2 — Batch-aware short-context CUDA dispatch
+
+`scan="auto"` now uses **measured T4-specific** shape selection:
+
+| Device | Batch | Context | Scan |
+|---|---:|---:|---|
+| Tesla T4 / NVIDIA T4 (sm75) | 1 | 128–512 | SWQR-Short, 16 warps |
+| Tesla T4 / NVIDIA T4 (sm75) | 2 | 128–256 | SWQR-Short, 8 warps |
+| Any CUDA device | other multi-token shapes | 2+ | Original SWQR |
+| CPU | any | 2+ | PyTorch Thunder |
+| Any device | any | 1 | Direct recurrent update |
+
+The `swqr_short`, `swqr`, `swqr_adaptive`, `thunder`, and `original` explicit
+options remain available, including `swqr_warps` for manual CUDA experiments.
+`swqr_adaptive` is now **batch-aware** by default; direct calls to
+`swqr_adaptive_scan(..., cutoff=N)` retain the older length-only policy.
+
+On unprofiled GPUs, no short-path speedup is assumed: `auto` uses original SWQR.
+A failed short CUDA build falls back to original SWQR and finally Thunder when
+using `scan="auto"`; strict native modes raise on failure.
+
+To inspect the selection without launching a kernel:
+
+```python
+from fastesa import select_swqr_backend
+print(select_swqr_backend(1, 256, "cuda:0"))
+```
+
+Run `python benchmark_dispatch_v032.py --smoke` for CPU checks, or execute
+`python benchmark_dispatch_v032.py --device cuda:0` on Kaggle T4 to test parity,
+gradients and throughput. Native v0.3.2 CUDA has **not yet been benchmarked**
+in the package-build environment.

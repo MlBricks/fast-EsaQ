@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastEsa"
-version = "0.3.0"
+version = "0.3.2"
 description = "MLBricks fastEsa with SWQR CUDA, Thunder, and direct recurrent decode"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.2", "numpy>=1.24"]

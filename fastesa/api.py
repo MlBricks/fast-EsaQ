@@ -33,29 +33,34 @@ def normalize_variant(variant: str) -> Variant:
 class FastESA(learned.ESAFullMixer):
     """Learned-retention FAST with weight-compatible execution backends.
 
-    scan='auto' (default): SWQR CUDA for multi-token inputs, Thunder otherwise,
-    always direct recurrence for a single cached token.
+    scan='auto' (default): T4 shape-aware SWQR CUDA (Short at measured small
+    shapes, original SWQR elsewhere), Thunder CPU/compile fallback, direct for
+    cached single-token decoding.
     scan='swqr': native SWQR (CUDA); scan='thunder': PyTorch hierarchical scan;
     scan='original': unchanged PROGRESS reference.
     """
 
     def __init__(self, dim: int, heads: int = 6, scan: str = "auto",
-                 thunder_compass: int = 16, swqr_chunk: int = 128):
+                 thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8):
         super().__init__(dim=dim, heads=heads, variant="learned")
-        if scan not in {"auto", "swqr", "thunder", "original"}:
-            raise ValueError("scan must be 'auto', 'swqr', 'thunder', or 'original'")
+        if scan not in {"auto", "swqr", "swqr_short", "swqr_adaptive", "thunder", "original"}:
+            raise ValueError("scan must be auto, swqr, swqr_short, swqr_adaptive, thunder or original")
         if not isinstance(thunder_compass, int) or thunder_compass < 1:
             raise ValueError("thunder_compass must be a positive integer")
         if swqr_chunk not in {16, 32, 64, 128, 256, 512}:
             raise ValueError("swqr_chunk must be a power of two in [16,512]")
         self.scan = scan
         self.thunder_compass = thunder_compass
+        if swqr_warps not in (4, 8, 16):
+            raise ValueError("swqr_warps must be 4, 8, or 16")
         self.swqr_chunk = swqr_chunk
+        self.swqr_warps = swqr_warps
 
     def forward(self, x, state=None):
         if self.scan == "original":
             return super().forward(x, state)
-        from ._scan import auto_scan, direct_scan, swqr_scan, thunder_scan
+        from ._scan import (auto_scan, direct_scan, swqr_scan, thunder_scan,
+                            swqr_short_scan, swqr_adaptive_scan)
         if x.ndim != 3:
             raise ValueError("Expected input [batch, sequence, dim]")
         B, T, D = x.shape
@@ -75,6 +80,11 @@ class FastESA(learned.ESAFullMixer):
             E = direct_scan(A, U, state)
         elif self.scan == "swqr":
             E = swqr_scan(A, U, state, chunk=self.swqr_chunk)
+        elif self.scan == "swqr_short":
+            E = swqr_short_scan(A, U, state, warps=self.swqr_warps)
+        elif self.scan == "swqr_adaptive":
+            E = swqr_adaptive_scan(A, U, state, warps=self.swqr_warps,
+                                   chunk=self.swqr_chunk)
         elif self.scan == "thunder":
             E = thunder_scan(A, U, state, compass=self.thunder_compass)
         else:
@@ -96,13 +106,13 @@ class FastESAModel(learned.KaggleRecall):
     """Original PROGRESS recall model with optional accelerated FAST mixers."""
     def __init__(self, vocab_size: int = 256, dim: int = 384,
                  heads: int = 6, layers: int = 6,
-                 scan: str = "auto", thunder_compass: int = 16, swqr_chunk: int = 128):
+                 scan: str = "auto", thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8):
         super().__init__(vocab_size=vocab_size, dim=dim, heads=heads,
                          layers=layers, variant="learned")
         if scan != "original":
             for block in self.blocks:
                 block.esa = FastESA(dim, heads, scan=scan,
-                                    thunder_compass=thunder_compass, swqr_chunk=swqr_chunk)
+                                    thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
         self.scan = scan
 
 
@@ -120,13 +130,13 @@ class QualityESAModel(hybrid.RecallModel):
 
 def make_esa(variant: str = "fast", *, dim: int = 384, heads: int = 6,
              chunk_size: int = 32, scan: str = "auto",
-             thunder_compass: int = 16, swqr_chunk: int = 128) -> nn.Module:
+             thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
     """Create standalone mixer, with original trained state_dict key layout."""
     if normalize_variant(variant) == "fast":
         if chunk_size != 32:
             raise ValueError("PROGRESS learned uses fixed chunk_size=32; cannot change it without changing the implementation")
         return FastESA(dim=dim, heads=heads, scan=scan,
-                       thunder_compass=thunder_compass, swqr_chunk=swqr_chunk)
+                       thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
     if scan not in {"auto", "original"}:
         raise ValueError("Only FAST supports selecting scan backends")
     return QualityESA(dim=dim, heads=heads, chunk_size=chunk_size)
@@ -135,7 +145,7 @@ def make_esa(variant: str = "fast", *, dim: int = 384, heads: int = 6,
 def make_model(variant: str = "fast", *, vocab_size: int = 256,
                dim: int = 384, heads: int = 6, layers: int = 6,
                chunk_size: int = 32, seed: int | None = None,
-               scan: str = "auto", thunder_compass: int = 16, swqr_chunk: int = 128) -> nn.Module:
+               scan: str = "auto", thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
     """Build original recall/LM-shaped model.
 
     If seed is provided, reproduce the variant's EXACT notebook initializer.
@@ -146,7 +156,7 @@ def make_model(variant: str = "fast", *, vocab_size: int = 256,
         if chunk_size != 32:
             raise ValueError("PROGRESS learned uses fixed chunk_size=32")
         model = FastESAModel(vocab_size=vocab_size, dim=dim, heads=heads, layers=layers,
-                             scan=scan, thunder_compass=thunder_compass, swqr_chunk=swqr_chunk)
+                             scan=scan, thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
         if seed is not None:
             learned.deterministic_init(model, int(seed))
         return model
@@ -176,7 +186,7 @@ def forward_tokens(model: nn.Module, tokens: torch.Tensor, states=None):
 def load_checkpoint(path: str | Path, *, variant: str | None = None,
                     device: str | torch.device = "cpu", chunk_size: int = 32,
                     trusted: bool = False, scan: str = "auto",
-                    thunder_compass: int = 16, swqr_chunk: int = 128) -> nn.Module:
+                    thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
     """Restore a `latest.pt` model produced by an ORIGINAL PROGRESS notebook.
 
     Only model weights are restored, not optimizer/scaler/RNG state. Architecture
@@ -229,6 +239,6 @@ def load_checkpoint(path: str | Path, *, variant: str | None = None,
         heads = int(state["blocks.0.esa.log_half_life"].numel())
     model = make_model(v, vocab_size=int(vocab_size), dim=int(dim),
                        heads=heads, layers=layers, chunk_size=chunk_size,
-                       scan=scan, thunder_compass=thunder_compass, swqr_chunk=swqr_chunk)
+                       scan=scan, thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
     model.load_state_dict(state, strict=True)
     return model.to(device)
