@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastEsa"
-version = "0.3.2"
-description = "MLBricks fastEsa with SWQR CUDA, Thunder, and direct recurrent decode"
+version = "0.3.8"
+description = "MLBricks fastEsa with CUDA accelerated half-life Quality ESA and SWQR scan"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.2", "numpy>=1.24"]
 readme = "README.md"

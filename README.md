@@ -3,8 +3,10 @@
 This **independent, installable Python library** includes the two original
 PROGRESS model implementations alongside optimized FAST execution backends.
 The original model equations, gate parameters, and checkpoint keys are kept.
-Select `scan="original"` to reproduce the exact original FAST scan; the new
-default `scan="auto"` chooses accelerated implementations.
+Select `scan="original"` to reproduce the exact original scan; the default
+`scan="auto"` selects the CUDA SWQR backend for **both Fast and Quality ESA**
+(with Thunder fallback on CPU). Quality ESA also includes the original fused
+half-life CUDA decode kernel and optional whole-model CUDA Graph replay.
 
 | Public variant | Exact notebook implementation | Mixer class |
 |---|---|---|
@@ -21,7 +23,7 @@ datasets/hardware. No trained weights were included in the uploaded material.
 ```bash
 pip install .
 # Or from the generated wheel (torch/numpy must be available):
-pip install ./fastesa-0.3.0-py3-none-any.whl
+pip install ./dist/fastesa-0.3.8-py3-none-any.whl
 ```
 
 ## Mixer use (the original equations, without modifications)
@@ -102,7 +104,7 @@ python -m fastesa._original.progress_hybrid --action smoke --device cpu --dim 48
 Original scripts use their original default Kaggle output directories and
 model labels (`learned` and `hybrid`). New public aliases do not rename
 checkpoint directories or modify existing experiments. The original reference and Thunder PyTorch paths need no CUDA extension.
-The default FAST CUDA SWQR path lazily compiles an optional native CUDA
+The default Fast/Quality CUDA SWQR path lazily compiles an optional native CUDA
 extension (set `scan="thunder"` to skip it). CPU and CUDA PyTorch are supported.
 
 ## Mathematical summary
@@ -116,7 +118,7 @@ v0.3 default FAST dispatch uses SWQR CUDA or Thunder PyTorch.
 `quality`: `q,g,vraw = W_qgv x`; `A = exp(-ln(2)*softplus(g+b_h)/half_life_h)`;
 `U = (1-A)*tanh(vraw)`; `E = A*Eprev + U`;
 `Y = W_O(sigmoid(q)*RMSNorm(E))`. `half_life_h` and bias are trainable.
-Scan uses the original division-free associative composition in chunks.
+Original scan uses division-free associative composition; the optimized path uses SWQR CUDA or Thunder, plus an inference-only fused CUDA decode kernel.
 
 Both models have fixed-size recurrent state `[B, H, D/H]` per block.
 The quality implementation requires six heads and the fast implementation
@@ -227,3 +229,73 @@ Run `python benchmark_dispatch_v032.py --smoke` for CPU checks, or execute
 `python benchmark_dispatch_v032.py --device cuda:0` on Kaggle T4 to test parity,
 gradients and throughput. Native v0.3.2 CUDA has **not yet been benchmarked**
 in the package-build environment.
+
+
+## v0.3.8 patch: accelerated half-life Quality ESA
+
+The original PROGRESS `HybridESA` remains in `fastesa/_original/progress_hybrid.py`.
+New public `QualityESA` and `QualityESAModel` **reuse its exact parameters**:
+`qgv`, `W_O`, `state_norm`, `log_half_life`, `raw_decay_bias`.
+No weights need to be converted, and the mathematical recurrence is unchanged:
+
+```text
+A = exp(-ln(2) * softplus(G + raw_decay_bias) / exp(log_half_life))
+U = (1 - A) * tanh(V)
+E = A * E_previous + U
+read = sigmoid(Q) * RMSNorm(E, state_norm.weight)
+Y = W_O(read)
+```
+
+Implementation changes:
+
+- `scan='auto'`: CUDA SWQR forward/backward for multi-token training and prefill; `thunder` on CPU. `scan='original'` is still the unchanged reference.
+- `fused_decode='auto'`: for `T=1` during CUDA inference, a C++/CUDA kernel computes the **original half-life gate**, bounded write, FP32 state, learned RMSNorm and sigmoid-query readout in one launch. `fused_decode='on'` strictly requires native CUDA; `off` always uses normal PyTorch operations. The experimental cached reciprocal/`exp2f` gate is intentionally **not** the default; it was slower in the earlier T4 run.
+- `CUDAGreedyGraph`: optional **per-GPU explicit-stream** autoregressive capture, supporting graph-unrolled generation without CPU launch per token. Capture after training with model `.eval()`; recapture after optimizer steps/weight reloads.
+- Native code is **lazily compiled** and requires nvcc only for CUDA acceleration; CPU usage requires no CUDA build.
+
+```python
+import torch
+from fastesa import make_model, forward_tokens, CUDAGreedyGraph, prepare_quality_decode
+
+# Use gpu cuda:1 in a dual-T4 setup or cuda:0 on a single GPU.
+device = 'cuda:1'
+model = make_model('quality', layers=6, dim=384, heads=6,
+                   scan='auto', fused_decode='on', seed=2026).to(device).eval()
+prepare_quality_decode()  # compile once before graph capture
+prompt = torch.tensor([[79, 110, 99, 101]], device=device)
+with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16):
+    last_logits, states = forward_tokens(model, prompt)
+    one_token = last_logits.argmax(-1).view(-1, 1)
+    _, updated_states = forward_tokens(model, one_token, states)
+
+# Opt-in CUDA Graph; exact 128-token greedy continuation; no retraining.
+decoder = CUDAGreedyGraph(model, prompt, unroll=8)
+print('CUDA Graph max state difference:', decoder.check_parity())
+print(decoder.generate(128).shape)  # [1,128] on GPU
+```
+
+Reference/checkpoint usage:
+
+```python
+baseline = make_model('quality', scan='original', seed=2026)
+accelerated = make_model('quality', scan='auto', seed=2026)
+accelerated.load_state_dict(baseline.state_dict(), strict=True)
+# Existing original PROGRESS checkpoint format can be restored directly:
+# load_checkpoint('/path/to/latest.pt', variant='quality', scan='auto')
+```
+
+CUDA validation on Kaggle T4:
+
+```bash
+pip install -e .
+python -m pytest -q tests
+python examples/benchmark_quality_optimized.py
+```
+
+The 141 CPU tests and one CUDA-skipped test were executed locally. CUDA
+extension compilation, GPU numerical parity and graph throughput have **not**
+been run against this packaged v0.3.8 patch in this CPU-only environment.
+The previously reported ~1,727 byte-tokens/s Quality ESA graph decode was
+from the separate Kaggle notebook (v0.3.7.1), not a measurement of this patch.
+
+**License:** the upstream noncommercial licensing notice remains in force.

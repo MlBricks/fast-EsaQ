@@ -68,7 +68,7 @@ def test_model_checkpoint_stable(tmp_path):
     original = forward_tokens(m1, tokens)[0]
     torch.testing.assert_close(forward_tokens(m2, tokens)[0], original, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(forward_tokens(m3, tokens)[0], original, rtol=1e-4, atol=1e-4)
-    assert __version__ == "0.3.2"
+    assert __version__ == "0.3.8"
 
 
 def test_state_gradient_recurrence():

@@ -6,6 +6,7 @@
 #include <ATen/ATen.h>
 #include <torch/types.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -70,6 +71,7 @@ void run(const float* A, const float* U, const float* state, float* output,
 
 torch::Tensor swqr_short_scan_cuda(torch::Tensor A, torch::Tensor U,
                                   torch::Tensor state, int64_t warps) {
+    c10::cuda::CUDAGuard guard(A.device());
     const auto B64 = A.size(0), T64 = A.size(1), D64 = A.size(2) * A.size(3);
     TORCH_CHECK(T64 >= 1 && T64 <= 2048, "SWQR-Short supports 1..2048 tokens");
     TORCH_CHECK(B64 <= 65535 && D64 <= INT32_MAX, "SWQR-Short unsupported shape");

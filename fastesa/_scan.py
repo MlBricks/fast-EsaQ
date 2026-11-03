@@ -11,6 +11,7 @@ import warnings
 from pathlib import Path
 
 import torch
+from contextlib import nullcontext
 from torch import Tensor
 from torch.autograd import Function
 from torch.nn import functional as F
@@ -109,7 +110,8 @@ def _extension():
 class _SWQR(Function):
     @staticmethod
     def forward(ctx, A: Tensor, U: Tensor, state: Tensor, chunk: int):
-        E = _extension().scan(A.contiguous(), U.contiguous(), state.contiguous(), chunk)
+        with (torch.cuda.device(A.device) if A.is_cuda else nullcontext()):
+            E = _extension().scan(A.contiguous(), U.contiguous(), state.contiguous(), chunk)
         ctx.save_for_backward(A, E, state)
         ctx.chunk = chunk
         return E
@@ -121,7 +123,8 @@ class _SWQR(Function):
         Ar = torch.cat((torch.zeros_like(A[:, :1]), A[:, 1:].flip(1)), dim=1).contiguous()
         Ur = gradE.float().flip(1).contiguous()
         empty = A.new_empty(0)
-        r = _extension().scan(Ar, Ur, empty, ctx.chunk).flip(1)
+        with (torch.cuda.device(A.device) if A.is_cuda else nullcontext()):
+            r = _extension().scan(Ar, Ur, empty, ctx.chunk).flip(1)
         initial = state.unsqueeze(1) if state.numel() else torch.zeros_like(E[:, :1])
         previous = torch.cat((initial, E[:, :-1]), dim=1)
         dA = r * previous
@@ -253,7 +256,8 @@ def _short_extension():
 class _SWQRShort(Function):
     @staticmethod
     def forward(ctx, A: Tensor, U: Tensor, state: Tensor, warps: int):
-        E = _short_extension().scan(A.contiguous(), U.contiguous(), state.contiguous(), warps)
+        with (torch.cuda.device(A.device) if A.is_cuda else nullcontext()):
+            E = _short_extension().scan(A.contiguous(), U.contiguous(), state.contiguous(), warps)
         ctx.save_for_backward(A, E, state)
         ctx.warps = warps
         return E
@@ -264,7 +268,8 @@ class _SWQRShort(Function):
         # Reverse-time affine recurrence. Exact gradient of E[t]=A[t]E[t-1]+U[t].
         Ar = torch.cat((torch.zeros_like(A[:, :1]), A[:, 1:].flip(1)), dim=1).contiguous()
         Ur = gradE.float().flip(1).contiguous()
-        r = _short_extension().scan(Ar, Ur, A.new_empty(0), ctx.warps).flip(1)
+        with (torch.cuda.device(A.device) if A.is_cuda else nullcontext()):
+            r = _short_extension().scan(Ar, Ur, A.new_empty(0), ctx.warps).flip(1)
         previous = torch.cat((state.unsqueeze(1) if state.numel() else
                               torch.zeros_like(E[:, :1]), E[:, :-1]), dim=1)
         dA = r * previous

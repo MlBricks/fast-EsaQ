@@ -6,3 +6,5 @@ include SOURCE_PROVENANCE.txt
 
 recursive-include fastesa/_cuda *.cu *.cpp
 include RELEASE_NOTES_v0.3.md
+
+include RELEASE_NOTES_v0.3.8.md

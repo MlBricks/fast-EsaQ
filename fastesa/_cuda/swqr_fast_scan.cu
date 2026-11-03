@@ -4,6 +4,7 @@
 #include <ATen/ATen.h>
 #include <torch/types.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -90,6 +91,7 @@ __global__ void chunk_outputs_kernel(const float* __restrict__ a,
 // Public binding shape [B,T,H,Dh]. The flattened last two dims form D.
 torch::Tensor swqr_fast_scan_cuda(torch::Tensor a,torch::Tensor u,
                                  torch::Tensor state,int64_t chunk) {
+    c10::cuda::CUDAGuard guard(a.device());
     const int64_t B=a.size(0), T=a.size(1);
     const int64_t D=a.size(2)*a.size(3);
     const int64_t G=(T+chunk-1)/chunk;

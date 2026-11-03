@@ -1,12 +1,12 @@
-"""Public fastEsa variants backed by the original PROGRESS implementations.
+"""fastEsa: original PROGRESS math with optional accelerated execution.
 
-Fast aliases Learned ESA (without learned_lm extension).
-Quality aliases Bounded-write Hybrid ESA (not the original half-life baseline).
-No mathematical kernels or weight-key layouts are rewritten here.
+Fast = learned-bounds ESA. Quality = bounded-write half-life hybrid ESA.
+The checkpoint weight keys and recurrent equations stay unchanged.
 """
 from __future__ import annotations
 
 from pathlib import Path
+import math
 from types import SimpleNamespace
 import re
 from typing import Literal
@@ -96,10 +96,100 @@ class FastESA(learned.ESAFullMixer):
 
 
 class QualityESA(hybrid.HybridESA):
-    """Unmodified PROGRESS `hybrid` recurrence (requires six heads)."""
+    """Accelerated half-life ESA with the ORIGINAL PROGRESS hybrid weights.
 
-    def __init__(self, dim: int, heads: int = 6, chunk_size: int = 32):
+    - scan='original': exact original PROGRESS chunk-scan implementation.
+    - scan='auto' (default): CUDA SWQR for prefill/training, Thunder for CPU,
+      direct recurrence for one-token decode.
+    - fused_decode='auto' (default): native fused CUDA gate/write/learned
+      RMSNorm/query readout for CUDA inference with T=1. Compilation failures
+      fall back with an explicit warning. 'on' raises, 'off' disables fusion.
+
+    CUDA Graph replay is separately opt-in via fastesa.cuda_graph.
+    No architecture, state_dict keys, parameters or recurrence are changed.
+    """
+
+    _scans = {"auto", "original", "swqr", "swqr_short", "swqr_adaptive", "thunder"}
+
+    def __init__(self, dim: int, heads: int = 6, chunk_size: int = 32,
+                 scan: str = "auto", fused_decode: str = "auto",
+                 thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8):
         super().__init__(dim=dim, heads=heads, chunk_size=chunk_size)
+        if scan not in self._scans:
+            raise ValueError(f"scan must be one of {sorted(self._scans)}")
+        if fused_decode not in {"auto", "on", "off"}:
+            raise ValueError("fused_decode must be 'auto', 'on', or 'off'")
+        if thunder_compass < 1 or not isinstance(thunder_compass, int):
+            raise ValueError("thunder_compass must be a positive integer")
+        if swqr_chunk not in {16, 32, 64, 128, 256, 512}:
+            raise ValueError("swqr_chunk must be 16, 32, 64, 128, 256 or 512")
+        if swqr_warps not in {4, 8, 16}:
+            raise ValueError("swqr_warps must be 4, 8, or 16")
+        self.scan = scan
+        self.fused_decode = fused_decode
+        self.thunder_compass = thunder_compass
+        self.swqr_chunk = swqr_chunk
+        self.swqr_warps = swqr_warps
+        self._fused_unavailable = False
+
+    def forward(self, x, state=None):
+        if self.scan == "original":
+            return super().forward(x, state)
+        from ._scan import (auto_scan, direct_scan, swqr_scan, thunder_scan,
+                            swqr_short_scan, swqr_adaptive_scan)
+        if x.ndim != 3 or x.size(-1) != self.dim:
+            raise ValueError(f"Input must be [B,T,{self.dim}]")
+        B, T, D = x.shape
+        if T < 1:
+            raise ValueError("Input sequence cannot be empty")
+        if state is not None and (tuple(state.shape) != (B, self.heads, self.dh)
+                                  or state.device != x.device):
+            raise ValueError(f"State must be [{B},{self.heads},{self.dh}] on {x.device}")
+        packed = self.qgv(x)
+
+        # Inference-only (no gradients) CUDA fusion. The trained weights and
+        # exact half-life mathematical formula are unchanged. Compilation is
+        # lazy; users should call prepare_quality_decode() before graph capture.
+        if (T == 1 and x.is_cuda and not torch.is_grad_enabled()
+                and self.fused_decode != "off" and not self._fused_unavailable):
+            try:
+                from ._quality_decode import decode_quality
+                read, final = decode_quality(
+                    packed, x, self.log_half_life, self.raw_decay_bias,
+                    self.state_norm.weight, state, self.heads)
+                return self.W_O(read), final
+            except (RuntimeError, OSError, ImportError) as exc:
+                if self.fused_decode == "on":
+                    raise
+                import warnings
+                self._fused_unavailable = True
+                warnings.warn(f"Quality fused CUDA decode unavailable ({exc}); "
+                              "using unfused recurrence", RuntimeWarning, stacklevel=2)
+
+        q, g, raw_v = packed.chunk(3, dim=-1)
+        z = g.reshape(B, T, self.heads, self.dh).float()
+        half_life = self.log_half_life.exp()
+        decay = F.softplus(z + self.raw_decay_bias[None, None, :, None])
+        A = torch.exp(-math.log(2.0) * decay / half_life[None, None, :, None])
+        value = torch.tanh(raw_v.reshape(B, T, self.heads, self.dh).float())
+        U = (1.0 - A) * value
+        if T == 1:
+            E = direct_scan(A, U, state)
+        elif self.scan == "swqr":
+            E = swqr_scan(A, U, state, chunk=self.swqr_chunk)
+        elif self.scan == "swqr_short":
+            E = swqr_short_scan(A, U, state, warps=self.swqr_warps)
+        elif self.scan == "swqr_adaptive":
+            E = swqr_adaptive_scan(A, U, state, warps=self.swqr_warps,
+                                   chunk=self.swqr_chunk)
+        elif self.scan == "thunder":
+            E = thunder_scan(A, U, state, compass=self.thunder_compass)
+        else:
+            E = auto_scan(A, U, state, compass=self.thunder_compass, chunk=self.swqr_chunk)
+        final = E[:, -1]
+        norm = self.state_norm(E.reshape(B, T, D))
+        read = (torch.sigmoid(q.float()) * norm).to(x.dtype)
+        return self.W_O(read), final
 
 
 class FastESAModel(learned.KaggleRecall):
@@ -117,19 +207,27 @@ class FastESAModel(learned.KaggleRecall):
 
 
 class QualityESAModel(hybrid.RecallModel):
-    """Original hybrid notebook's embedding, ESA blocks, FFN and tied LM head.
-
-    `forward(tokens, cached_states=None)` returns (logits [B,V], states).
-    """
-
+    """Original PROGRESS hybrid model, replacing only ESA execution backend."""
     def __init__(self, vocab_size: int = 256, dim: int = 384,
-                 heads: int = 6, layers: int = 6, chunk_size: int = 32):
+                 heads: int = 6, layers: int = 6, chunk_size: int = 32,
+                 scan: str = "auto", fused_decode: str = "auto",
+                 thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8):
         super().__init__(vocab_size=vocab_size, dim=dim, heads=heads,
                          layers=layers, variant="hybrid", chunk_size=chunk_size)
+        if scan != "original":
+            for block in self.blocks:
+                original = block.esa
+                accelerated = QualityESA(
+                    dim, heads, chunk_size=chunk_size, scan=scan,
+                    fused_decode=fused_decode, thunder_compass=thunder_compass,
+                    swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
+                accelerated.load_state_dict(original.state_dict(), strict=True)
+                block.esa = accelerated
+        self.scan = scan
 
 
 def make_esa(variant: str = "fast", *, dim: int = 384, heads: int = 6,
-             chunk_size: int = 32, scan: str = "auto",
+             chunk_size: int = 32, scan: str = "auto", fused_decode: str = "auto",
              thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
     """Create standalone mixer, with original trained state_dict key layout."""
     if normalize_variant(variant) == "fast":
@@ -137,15 +235,14 @@ def make_esa(variant: str = "fast", *, dim: int = 384, heads: int = 6,
             raise ValueError("PROGRESS learned uses fixed chunk_size=32; cannot change it without changing the implementation")
         return FastESA(dim=dim, heads=heads, scan=scan,
                        thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
-    if scan not in {"auto", "original"}:
-        raise ValueError("Only FAST supports selecting scan backends")
-    return QualityESA(dim=dim, heads=heads, chunk_size=chunk_size)
+    return QualityESA(dim=dim, heads=heads, chunk_size=chunk_size, scan=scan,
+                      fused_decode=fused_decode, thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
 
 
 def make_model(variant: str = "fast", *, vocab_size: int = 256,
                dim: int = 384, heads: int = 6, layers: int = 6,
                chunk_size: int = 32, seed: int | None = None,
-               scan: str = "auto", thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
+               scan: str = "auto", fused_decode: str = "auto", thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
     """Build original recall/LM-shaped model.
 
     If seed is provided, reproduce the variant's EXACT notebook initializer.
@@ -160,14 +257,16 @@ def make_model(variant: str = "fast", *, vocab_size: int = 256,
         if seed is not None:
             learned.deterministic_init(model, int(seed))
         return model
-    if scan not in {"auto", "original"}:
-        raise ValueError("Only FAST supports selecting scan backends")
+    model = QualityESAModel(vocab_size=vocab_size, dim=dim, heads=heads,
+                            layers=layers, chunk_size=chunk_size, scan=scan,
+                            fused_decode=fused_decode, thunder_compass=thunder_compass,
+                            swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
     if seed is not None:
         args = SimpleNamespace(seed=int(seed), vocab_size=vocab_size, dim=dim,
                                heads=heads, layers=layers, chunk_size=chunk_size)
-        return hybrid.build_model(args, "hybrid")
-    return QualityESAModel(vocab_size=vocab_size, dim=dim, heads=heads,
-                           layers=layers, chunk_size=chunk_size)
+        reference = hybrid.build_model(args, "hybrid")
+        model.load_state_dict(reference.state_dict(), strict=True)
+    return model
 
 
 def forward_tokens(model: nn.Module, tokens: torch.Tensor, states=None):
@@ -185,7 +284,7 @@ def forward_tokens(model: nn.Module, tokens: torch.Tensor, states=None):
 
 def load_checkpoint(path: str | Path, *, variant: str | None = None,
                     device: str | torch.device = "cpu", chunk_size: int = 32,
-                    trusted: bool = False, scan: str = "auto",
+                    trusted: bool = False, scan: str = "auto", fused_decode: str = "auto",
                     thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
     """Restore a `latest.pt` model produced by an ORIGINAL PROGRESS notebook.
 
@@ -239,6 +338,6 @@ def load_checkpoint(path: str | Path, *, variant: str | None = None,
         heads = int(state["blocks.0.esa.log_half_life"].numel())
     model = make_model(v, vocab_size=int(vocab_size), dim=int(dim),
                        heads=heads, layers=layers, chunk_size=chunk_size,
-                       scan=scan, thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
+                       scan=scan, fused_decode=fused_decode, thunder_compass=thunder_compass, swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
     model.load_state_dict(state, strict=True)
     return model.to(device)
