@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastEsa"
-version = "0.3.8"
-description = "MLBricks fastEsa with CUDA accelerated half-life Quality ESA and SWQR scan"
+version = "0.4.0"
+description = "MLBricks ESA with half-life current and historical base architectures, optimized CUDA scan and decoding"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.2", "numpy>=1.24"]
 readme = "README.md"
@@ -19,4 +19,4 @@ classifiers = ["Programming Language :: Python :: 3", "Programming Language :: P
 include = ["fastesa", "fastesa.*"]
 
 [tool.setuptools.package-data]
-"fastesa" = ["_cuda/*.cu", "_cuda/*.cpp"]
+"fastesa" = ["cuda/*.cu", "cuda/*.cpp"]

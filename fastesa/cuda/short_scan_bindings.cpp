@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cstdint>
 
-torch::Tensor swqr_short_scan_cuda(torch::Tensor A, torch::Tensor U,
+torch::Tensor short_scan_cuda(torch::Tensor A, torch::Tensor U,
                                   torch::Tensor state, int64_t warps);
 
 torch::Tensor scan(torch::Tensor A, torch::Tensor U,
@@ -19,7 +19,7 @@ torch::Tensor scan(torch::Tensor A, torch::Tensor U,
                 && state.size(1) == A.size(2) && state.size(2) == A.size(3)),
                 "State must have shape [B,H,Dh] or be empty");
     TORCH_CHECK(warps == 4 || warps == 8 || warps == 16, "warps must be 4/8/16");
-    return swqr_short_scan_cuda(A, U, state, warps);
+    return short_scan_cuda(A, U, state, warps);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

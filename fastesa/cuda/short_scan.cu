@@ -14,7 +14,7 @@
 
 namespace {
 template<int WARPS>
-__global__ void swqr_short_kernel(const float* __restrict__ A,
+__global__ void short_scan_kernel(const float* __restrict__ A,
                                   const float* __restrict__ U,
                                   const float* __restrict__ state,
                                   float* __restrict__ output,
@@ -63,13 +63,13 @@ template<int WARPS>
 void run(const float* A, const float* U, const float* state, float* output,
          int B, int T, int D, bool has_state, cudaStream_t stream) {
     dim3 grid(static_cast<unsigned>((D + 31) / 32), static_cast<unsigned>(B));
-    swqr_short_kernel<WARPS><<<grid, WARPS * 32, 0, stream>>>(
+    short_scan_kernel<WARPS><<<grid, WARPS * 32, 0, stream>>>(
         A, U, state, output, T, D, has_state);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 }  // namespace
 
-torch::Tensor swqr_short_scan_cuda(torch::Tensor A, torch::Tensor U,
+torch::Tensor short_scan_cuda(torch::Tensor A, torch::Tensor U,
                                   torch::Tensor state, int64_t warps) {
     c10::cuda::CUDAGuard guard(A.device());
     const auto B64 = A.size(0), T64 = A.size(1), D64 = A.size(2) * A.size(3);

@@ -89,7 +89,7 @@ __global__ void chunk_outputs_kernel(const float* __restrict__ a,
 }
 
 // Public binding shape [B,T,H,Dh]. The flattened last two dims form D.
-torch::Tensor swqr_fast_scan_cuda(torch::Tensor a,torch::Tensor u,
+torch::Tensor parallel_scan_cuda(torch::Tensor a,torch::Tensor u,
                                  torch::Tensor state,int64_t chunk) {
     c10::cuda::CUDAGuard guard(a.device());
     const int64_t B=a.size(0), T=a.size(1);

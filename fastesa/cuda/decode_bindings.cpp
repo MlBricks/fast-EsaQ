@@ -1,7 +1,7 @@
 // PyTorch binding for the original Half-Life Quality ESA inference-only one-token fusion.
 #include <torch/extension.h>
 #include <vector>
-std::vector<torch::Tensor> fused_quality_decode_cuda(
+std::vector<torch::Tensor> fused_decode_cuda(
     torch::Tensor qgv,torch::Tensor x,torch::Tensor log_half,
     torch::Tensor decay_bias,torch::Tensor norm_weight,
     torch::Tensor old_state,int64_t heads);
@@ -39,7 +39,7 @@ std::vector<torch::Tensor> forward(
               x.scalar_type()==at::kBFloat16,"x dtype must be fp32/fp16/bf16");
   TORCH_CHECK(qgv.scalar_type()==at::kFloat || qgv.scalar_type()==at::kHalf ||
               qgv.scalar_type()==at::kBFloat16,"qgv dtype must be fp32/fp16/bf16");
-  return fused_quality_decode_cuda(qgv,x,log_half,decay_bias,norm_weight,old_state,heads);
+  return fused_decode_cuda(qgv,x,log_half,decay_bias,norm_weight,old_state,heads);
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
     m.def("forward",&forward,"Fused half-life Quality ESA one-token readout and state update");

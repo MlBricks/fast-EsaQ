@@ -299,3 +299,34 @@ The previously reported ~1,727 byte-tokens/s Quality ESA graph decode was
 from the separate Kaggle notebook (v0.3.7.1), not a measurement of this patch.
 
 **License:** the upstream noncommercial licensing notice remains in force.
+
+
+## Unified ESA API (v0.4.0)
+
+The current ESA is the half-life recurrent variant. The historical learned-bounds
+architecture remains available as `variant="base"`. These are architecture choices;
+`backend` chooses an execution policy only.
+
+```python
+from fastesa import ESA, ESAConfig, save_esa_checkpoint, load_esa_checkpoint
+
+current = ESA(embd=384, head=6, backend="auto")
+base = ESA(embd=384, head=6, variant="base", backend="auto")
+explicit = ESA(embd=384, head=6, variant="current", backend="auto")
+
+# state_dict tensor keys are unchanged; architecture metadata prevents accidental conversion.
+save_esa_checkpoint(current, "current_esa.pt")
+restored = load_esa_checkpoint("current_esa.pt", backend="auto")
+
+# Force reference PyTorch computation, or require CUDA:
+current.set_backend("pytorch")
+current.set_backend("native")
+```
+
+`from fastesa import ESA` is the API of **this repository**. The equivalent
+`from mlbricks import ESA` import becomes available only after this component is
+merged into the separate MLBricks Kit distribution.
+
+The former `FastESA`/`QualityESA`, SWQR scan names, and CUDA-graph names remain
+importable for compatibility. Source files use `core`, `base`, `scan`, `decode`,
+`graph` and `cuda/`. Existing trained checkpoint weights are not converted.

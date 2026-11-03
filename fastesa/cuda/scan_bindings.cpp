@@ -3,7 +3,7 @@
 #include <torch/extension.h>
 #include <cstdint>
 
-torch::Tensor swqr_fast_scan_cuda(torch::Tensor a, torch::Tensor u,
+torch::Tensor parallel_scan_cuda(torch::Tensor a, torch::Tensor u,
                                   torch::Tensor state, int64_t chunk);
 
 torch::Tensor scan(torch::Tensor a, torch::Tensor u,
@@ -19,7 +19,7 @@ torch::Tensor scan(torch::Tensor a, torch::Tensor u,
   TORCH_CHECK(state.scalar_type()==at::kFloat && state.is_contiguous(), "State must be contiguous FP32");
   TORCH_CHECK(state.numel()==0 || (state.dim()==3 && state.size(0)==a.size(0)
          && state.size(1)==a.size(2) && state.size(2)==a.size(3)), "State must be [B,H,Dh] or empty");
-  return swqr_fast_scan_cuda(a,u,state,chunk);
+  return parallel_scan_cuda(a,u,state,chunk);
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
   m.def("scan",&scan,"SWQR FP32 chunked FastScan (forward only)",

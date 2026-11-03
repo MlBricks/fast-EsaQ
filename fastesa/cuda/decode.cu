@@ -17,7 +17,7 @@ __device__ __forceinline__ float softplus_stable(float z) {
   return z>20.f ? z : log1pf(expf(z));
 }
 template <typename IN,typename OUT,int THREADS>
-__global__ void esa_quality_decode(
+__global__ void esa_decode(
   const IN* __restrict__ packed,
   const float* __restrict__ log_half,
   const float* __restrict__ decay_bias,
@@ -64,12 +64,12 @@ void launch(const IN* qgv,const float* hl,const float* bias,const float* norm,
             const float* old,float* new_state,OUT* output,
             int B,int D,int Dh,bool has_state,cudaStream_t stream) {
   constexpr int THREADS=256;
-  esa_quality_decode<IN,OUT,THREADS><<<B,THREADS,0,stream>>>(
+  esa_decode<IN,OUT,THREADS><<<B,THREADS,0,stream>>>(
       qgv,hl,bias,norm,old,new_state,output,D,Dh,has_state);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 } // namespace
-std::vector<torch::Tensor> fused_quality_decode_cuda(
+std::vector<torch::Tensor> fused_decode_cuda(
     torch::Tensor qgv,torch::Tensor x,torch::Tensor log_half,
     torch::Tensor decay_bias,torch::Tensor norm_weight,
     torch::Tensor old_state,int64_t heads) {
