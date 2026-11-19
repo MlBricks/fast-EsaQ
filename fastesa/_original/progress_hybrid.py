@@ -129,15 +129,33 @@ class HybridESA(nn.Module):
         self.dim,self.heads,self.dh,self.chunk_size=dim,heads,dim//heads,chunk_size
         self.qgv=nn.Linear(dim,3*dim,bias=False)
         self.W_O=nn.Linear(dim,dim,bias=False)
-        self.state_norm=RMSNorm(dim)
-        self.log_half_life=nn.Parameter(torch.tensor(INITIAL_HALF_LIVES).log())
-        self.raw_decay_bias=nn.Parameter(torch.full((heads,),math.log(math.expm1(1.))))
+        self.state_norm=RMSNorm(dim).float()
+        self.log_half_life=nn.Parameter(torch.tensor(INITIAL_HALF_LIVES, dtype=torch.float32).log())
+        self.raw_decay_bias=nn.Parameter(torch.full((heads,),math.log(math.expm1(1.)),dtype=torch.float32))
+    def _apply(self, fn, recurse=True):
+        """Keep retention controls and state norm in FP32 during dtype/device casts.
+
+        Preserve the original FP32 values, not a roundtrip through FP16/BF16.
+        Delegate parameter identity, gradient handling and device moves to PyTorch.
+        """
+        protected = (self.log_half_life, self.raw_decay_bias, self.state_norm.weight)
+        ids = {id(p) for p in protected}
+        ids.update(id(p.grad) for p in protected if p.grad is not None)
+
+        def preserve_fp32(t):
+            converted = fn(t)
+            if id(t) in ids and converted.dtype != torch.float32:
+                return t.to(device=converted.device, dtype=torch.float32)
+            return converted
+
+        return super()._apply(preserve_fp32, recurse=recurse)
+
     def forward(self,x,state=None):
         B,T,_=x.shape
         q,g,raw_v=self.qgv(x).chunk(3,dim=-1)
         z=g.reshape(B,T,self.heads,self.dh).float()
-        half_life=self.log_half_life.exp()
-        decay=F.softplus(z+self.raw_decay_bias[None,None,:,None])
+        half_life=self.log_half_life.float().exp()
+        decay=F.softplus(z+self.raw_decay_bias.float()[None,None,:,None])
         a=torch.exp(-math.log(2.)*decay/half_life[None,None,:,None])
         v=torch.tanh(raw_v.reshape(B,T,self.heads,self.dh).float())
         u=(1.0-a)*v

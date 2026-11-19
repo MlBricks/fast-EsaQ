@@ -188,8 +188,8 @@ class ESA(hybrid.HybridESA):
 
         q, g, raw_v = packed.chunk(3, dim=-1)
         z = g.reshape(B, T, self.heads, self.dh).float()
-        half_life = self.log_half_life.exp()
-        decay = F.softplus(z + self.raw_decay_bias[None, None, :, None])
+        half_life = self.log_half_life.float().exp()
+        decay = F.softplus(z + self.raw_decay_bias.float()[None, None, :, None])
         A = torch.exp(-math.log(2.0) * decay / half_life[None, None, :, None])
         value = torch.tanh(raw_v.reshape(B, T, self.heads, self.dh).float())
         U = (1.0 - A) * value
