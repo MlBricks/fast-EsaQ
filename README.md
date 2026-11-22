@@ -26,6 +26,38 @@ pip install .
 pip install ./dist/fastesa-0.3.8-py3-none-any.whl
 ```
 
+## Validated current ESA half-life defaults
+
+New **current / quality ESA** instances start with these explicit nominal
+half-lives (H1 through H6) in **every** layer:
+
+```python
+(0.125, 0.5, 2.0, 8.0, 32.0, 64.0)
+```
+
+These values are assigned directly at model initialization rather than
+obtained by dividing a larger schedule by 128. Each head's
+`log_half_life` is an independent trainable FP32 parameter. The model still
+computes `A = exp(-ln(2) * softplus(g + bias) / half_life)` at runtime; the
+half-life denominator in this equation is not removed.
+
+This is **an initialization change**, not a new architecture or a pretrained
+model. It is applied to both standalone mixers and full models, including
+reference/optimized scans and `make_model(..., seed=...)`. Previously saved
+checkpoints continue to restore their own learned half-life tensors.
+The archived research implementation under `fastesa/_original/` is not
+modified and retains its original larger half-lives.
+
+### Verify the new defaults
+
+```python
+from fastesa import ESA, make_model
+mixer = ESA(embd=384, head=6, backend="pytorch")
+print(mixer.log_half_life.float().exp().detach().tolist())
+model = make_model("current", dim=384, heads=6, layers=4, seed=20261103)
+print(model.blocks[0].esa.log_half_life.float().exp().detach().tolist())
+```
+
 ## Mixer use (the original equations, without modifications)
 
 ```python
@@ -84,7 +116,8 @@ model_quality = make_model("quality", seed=2026)
 ```
 
 These *different* seeds reproduce their respective source notebooks'
-initialization—not a shared learned-vs-hybrid initialization.
+initialization for non-retention weights; current ESA now uses the explicit
+benchmarked head schedule above. BaseESA remains unchanged.
 
 ## Exact original source
 
