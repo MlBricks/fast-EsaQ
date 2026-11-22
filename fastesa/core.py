@@ -19,6 +19,29 @@ from ._original import progress_hybrid as hybrid
 
 Variant = Literal["base", "current"]
 
+# Validated ESA current-variant initialization (H1..H6).
+# Enter the six starting nominal half-lives directly. These are NOT fixed
+# retention windows; each head continues learning its FP32 log_half_life.
+# The archived PROGRESS research implementation in _original/ remains intact.
+DEFAULT_CURRENT_HALF_LIVES = (0.125, 0.5, 2.0, 8.0, 32.0, 64.0)
+
+
+def _initialize_current_half_lives(mixer: nn.Module) -> None:
+    """Set direct half-life defaults without changing checkpoint tensor keys."""
+    param = mixer.log_half_life
+    if param.numel() != len(DEFAULT_CURRENT_HALF_LIVES):
+        raise ValueError("Current ESA requires exactly six half-life heads")
+    with torch.no_grad():
+        values = torch.tensor(DEFAULT_CURRENT_HALF_LIVES,
+                              dtype=param.dtype, device=param.device)
+        param.copy_(values.log())
+
+
+def _initialize_current_model_half_lives(model: nn.Module) -> None:
+    """Apply to every layer after construction and optional seed loading."""
+    for block in model.blocks:
+        _initialize_current_half_lives(block.esa)
+
 
 def normalize_variant(variant: str) -> Variant:
     """Canonicalize ESA architecture names; historical names stay valid."""
@@ -135,6 +158,9 @@ class ESA(hybrid.HybridESA):
                  scan: str = "auto", fused_decode: str = "auto",
                  thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8):
         super().__init__(dim=dim, heads=heads, chunk_size=chunk_size)
+        # Only the new model's starting values change. The archived reference
+        # class stays untouched and loading a checkpoint still overrides them.
+        _initialize_current_half_lives(self)
         scan = normalize_scan(scan)
         if fused_decode not in {"auto", "on", "off"}:
             raise ValueError("fused_decode must be 'auto', 'on', or 'off'")
@@ -245,6 +271,10 @@ class ESAModel(hybrid.RecallModel):
                     swqr_chunk=swqr_chunk, swqr_warps=swqr_warps)
                 accelerated.load_state_dict(original.state_dict(), strict=True)
                 block.esa = accelerated
+        # The historical parent and copied reference weights have the old
+        # initialization. Install the new explicit defaults for BOTH scan
+        # backends, without changing any other weight or module state.
+        _initialize_current_model_half_lives(self)
         self.scan = normalize_scan(scan)
 
 
@@ -267,7 +297,8 @@ def make_model(variant: str = "current", *, vocab_size: int = 256,
                scan: str = "auto", fused_decode: str = "auto", thunder_compass: int = 16, swqr_chunk: int = 128, swqr_warps: int = 8) -> nn.Module:
     """Build original recall/LM-shaped model.
 
-    If seed is provided, reproduce the variant's EXACT notebook initializer.
+    If seed is provided, reproduce the original deterministic initializer for
+    non-retention weights; current ESA heads use the validated direct defaults.
     This is an architecture factory, not a pretrained weights download.
     """
     v = normalize_variant(variant)
@@ -288,6 +319,10 @@ def make_model(variant: str = "current", *, vocab_size: int = 256,
                                heads=heads, layers=layers, chunk_size=chunk_size)
         reference = hybrid.build_model(args, "hybrid")
         model.load_state_dict(reference.state_dict(), strict=True)
+        # Seeded reference initializers predate the validated head schedule.
+        # Retain their determinism for all other weights, but explicitly set
+        # the chosen new ESA half-lives after the reference weights are loaded.
+        _initialize_current_model_half_lives(model)
     return model
 
 
